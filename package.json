@@ -1,0 +1,43 @@
+{
+  "name": "ai-server",
+  "version": "1.0.1",
+  "license": "MIT",
+  "author": "Dimitry Ivanov <2@ivanoff.org.ua> # curl -A cv ivanoff.org.ua",
+  "description": "An OpenAI and Claude API compatible server using node-llama-cpp for local LLM models",
+  "keywords": [
+    "ai",
+    "ai server",
+    "llm",
+    "openai",
+    "api",
+    "local",
+    "server",
+    "node-llama-cpp",
+    "llama",
+    "claude"
+  ],
+  "scripts": {
+    "build": "bun build ./src/server.ts --outdir ./dist --minify --target node --external node-llama-cpp --external express && tsc",
+    "start": "node ./dist/server.js"
+  },
+  "dependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.1",
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "node-llama-cpp": "^3.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ivanoff/ai-server.git"
+  },
+  "files": [
+    "dist/**",
+    "src/**"
+  ]
+}
