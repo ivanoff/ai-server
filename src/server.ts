@@ -1,3 +1,4 @@
+import 'the-log';
 import express from 'express';
 import cors from 'cors';
 import { getLlama, LlamaModel, LlamaChatSession } from 'node-llama-cpp';
@@ -5,6 +6,8 @@ import bodyParser from 'body-parser';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import type { Request, Response, NextFunction } from 'express';
+import type { MessageType, ChatCompletionRequestType, ClaudeMessageRequestType } from './types';
 
 // For working with __dirname in ESM
 const __filename = fileURLToPath(import.meta.url);
@@ -12,11 +15,29 @@ const __dirname = path.dirname(__filename);
 
 // Load environment variables from .env file
 dotenv.config();
+const {
+  PORT,
+  MODEL_PATH,
+  DEFAULT_MAX_TOKENS,
+  GPU_LAYERS,
+  API_KEY
+} = process.env;
 
 const app = express();
-const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
-const MODEL_PATH = process.env.MODEL_PATH || path.join(__dirname, '..', 'models', 'llama-2-7b-chat.gguf');
-const DEFAULT_MAX_TOKENS = parseInt(process.env.DEFAULT_MAX_TOKENS || '2048');
+const port = PORT ? parseInt(PORT) : 3000;
+const modelPath = MODEL_PATH || path.join(__dirname, '..', 'models', 'llama-2-7b-chat.gguf');
+const defaultMaxTokens = parseInt(DEFAULT_MAX_TOKENS || '2048');
+
+const apiKeyMiddleware: (req: Request, res: Response, next: NextFunction) => void = (req, res, next) => {
+  if (!API_KEY) return next();
+
+  const apiKeyRaw = req.headers['x-api-key'] || req.headers['authorization'] || '';
+  const apiKey = typeof apiKeyRaw === 'string' && apiKeyRaw.replace(/^bearer /i, '').trim();
+
+  if (apiKey !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+
+  next();
+};
 
 // Middleware
 app.use(cors());
@@ -31,9 +52,8 @@ console.log("GPU type:", llama.gpu);
 const initModel = async () => {
   try {
     model = await llama.loadModel({
-      modelPath: MODEL_PATH,
-      // enableLogging: process.env.DEBUG === 'true',
-      gpuLayers: process.env.GPU_LAYERS ? parseInt(process.env.GPU_LAYERS) : 0
+      modelPath: modelPath,
+      gpuLayers: GPU_LAYERS ? parseInt(GPU_LAYERS) : 0
     });
     console.log('Model loaded successfully');
   } catch (error) {
@@ -43,7 +63,7 @@ const initModel = async () => {
 };
 
 // Convert messages to a format compatible with Llama
-function formatMessagesForLlama(messages: Message[]): string {
+function formatMessagesForLlama(messages: MessageType[]): string {
   let formattedPrompt = '';
   
   for (const message of messages) {
@@ -67,15 +87,16 @@ function formatMessagesForLlama(messages: Message[]): string {
 }
 
 // OpenAI compatible /chat/completions endpoint
-app.post('/v1/chat/completions', async (req: any, res: any) => {
+app.post('/v1/chat/completions', apiKeyMiddleware, async (req: Request, res: Response) => {
   try {
-    const { messages, model: modelName, max_tokens, temperature, stream } = req.body as ChatCompletionRequest;
+    const { messages, model: modelName, max_tokens, temperature, stream } = req.body as ChatCompletionRequestType;
     
     if (!messages || !Array.isArray(messages)) {
-      return res.status(400).json({ error: 'Messages array is required' });
+      res.status(400).json({ error: 'Messages array is required' });
+      return;
     }
     
-    const maxTokens = max_tokens || DEFAULT_MAX_TOKENS;
+    const maxTokens = max_tokens || defaultMaxTokens;
     const temp = temperature || 0.7;
     
     const context = await model.createContext();
@@ -176,15 +197,16 @@ app.post('/v1/chat/completions', async (req: any, res: any) => {
 });
 
 // Claude compatible API endpoint
-app.post('/v1/messages', async (req: any, res: any) => {
+app.post('/v1/messages', apiKeyMiddleware, async (req: Request, res: Response) => {
   try {
-    const { model: modelName, messages, max_tokens, temperature, stream } = req.body as ClaudeMessageRequest;
+    const { model: modelName, messages, max_tokens, temperature, stream } = req.body as ClaudeMessageRequestType;
     
     if (!messages || !Array.isArray(messages)) {
-      return res.status(400).json({ error: 'Messages array is required' });
+      res.status(400).json({ error: 'Messages array is required' });
+      return;
     }
     
-    const maxTokens = max_tokens || DEFAULT_MAX_TOKENS;
+    const maxTokens = max_tokens || defaultMaxTokens;
     const temp = temperature || 0.7;
     
     // Transform messages from Claude format to Llama format
@@ -284,7 +306,7 @@ app.post('/v1/messages', async (req: any, res: any) => {
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', model: MODEL_PATH });
+  res.json({ status: 'ok', model: modelPath });
 });
 
 // Models endpoint for OpenAI API compatibility
@@ -306,9 +328,9 @@ app.get('/v1/models', (req, res) => {
 const startServer = async () => {
   await initModel();
   
-  app.listen(PORT, () => {
-    console.log(`Llama API server running on port ${PORT}`);
-    console.log(`Model path: ${MODEL_PATH}`);
+  app.listen(port, () => {
+    console.log(`Llama API server running on port ${port}`);
+    console.log(`Model path: ${modelPath}`);
   });
 };
 
@@ -316,25 +338,3 @@ startServer().catch(error => {
   console.error('Failed to start server:', error);
   process.exit(1);
 });
-
-// Typing for request and response
-interface Message {
-  role: string;
-  content: string;
-}
-
-interface ChatCompletionRequest {
-  messages: Message[];
-  model?: string;
-  max_tokens?: number;
-  temperature?: number;
-  stream?: boolean;
-}
-
-interface ClaudeMessageRequest {
-  messages: Message[];
-  model?: string;
-  max_tokens?: number;
-  temperature?: number;
-  stream?: boolean;
-}

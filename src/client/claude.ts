@@ -4,7 +4,7 @@ const response = await fetch('http://localhost:3000/v1/messages', {
   body: JSON.stringify({
     model: 'llama-local',
     messages: [
-      { role: 'human', content: 'Расскажи о TypeScript' }
+      { role: 'human', content: 'Tell me a little bit about TypeScript' }
     ],
     max_tokens: 500,
     temperature: 0.7

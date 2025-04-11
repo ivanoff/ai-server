@@ -4,8 +4,8 @@ const response = await fetch('http://localhost:3000/v1/chat/completions', {
   body: JSON.stringify({
     model: 'llama-local',
     messages: [
-      { role: 'system', content: 'Ты полезный ассистент.' },
-      { role: 'user', content: 'Расскажи о TypeScript' }
+      { role: 'system', content: 'You are a helpful assistant.' },
+      { role: 'user', content: 'Tell me a little bit about TypeScript' }
     ],
     max_tokens: 500,
     temperature: 0.7

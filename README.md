@@ -8,6 +8,7 @@ A TypeScript microservice that provides an API compatible with OpenAI and Claude
 - 🤖 Compatibility with Anthropic Claude API (`/v1/messages`)
 - 🐟 Full compatibility with DeepSeek API (`/v1/chat/completions`)
 - 🌊 Support for streaming generation (Streaming API)
+- 🔑 Your own API key authentication
 - 🧠 Run local LLM models in GGUF format
 - ⚙️ Configuration through environment variables
 - 🔍 Monitoring via `/health` endpoint
@@ -83,10 +84,10 @@ PORT=3000
 DEFAULT_MAX_TOKENS=2048
 
 # Number of model layers to offload to GPU (0 for CPU-only)
-GPU_LAYERS=0
+GPU_LAYERS=120
 
-# Enable logging (true/false)
-DEBUG=false
+# API key for authentication
+API_KEY=your_api_key
 ```
 
 ## Usage Examples
@@ -96,7 +97,10 @@ DEBUG=false
 ```typescript
 const response = await fetch('http://localhost:3000/v1/chat/completions', {
   method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer your_api_key'
+  },
   body: JSON.stringify({
     model: 'llama-local',
     messages: [
@@ -117,7 +121,10 @@ console.log(data);
 ```typescript
 const response = await fetch('http://localhost:3000/v1/messages', {
   method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
+  headers: {
+    'Content-Type': 'application/json',
+    'x-api-key': 'your_api_key'
+  },
   body: JSON.stringify({
     model: 'llama-local',
     messages: [
