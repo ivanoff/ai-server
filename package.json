@@ -1,6 +1,6 @@
 {
   "name": "ai-server",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "license": "MIT",
   "author": "Dimitry Ivanov <2@ivanoff.org.ua> # curl -A cv ivanoff.org.ua",
   "description": "An OpenAI and Claude API compatible server using node-llama-cpp for local LLM models",

@@ -166,7 +166,7 @@ app.post('/v1/chat/completions', apiKeyMiddleware, async (req: Request, res: Res
         maxTokens,
         temperature: temp
       });
-      
+
       res.json({
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
@@ -189,6 +189,9 @@ app.post('/v1/chat/completions', apiKeyMiddleware, async (req: Request, res: Res
         }
       });
     }
+
+    context.dispose();
+
   } catch (error) {
     console.error('Error processing request:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -297,6 +300,9 @@ app.post('/v1/messages', apiKeyMiddleware, async (req: Request, res: Response) =
         }
       });
     }
+
+    context.dispose();
+
   } catch (error) {
     console.error('Error processing request:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
