@@ -14,3 +14,5 @@ const response = await fetch('http://localhost:3000/v1/messages', {
 const data = await response.json();
 console.log(JSON.stringify(data, null, '  '));
 
+
+export {};

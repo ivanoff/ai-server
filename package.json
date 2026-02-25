@@ -1,6 +1,7 @@
 {
   "name": "ai-server",
   "version": "2.0.2",
+  "type": "module",
   "license": "MIT",
   "author": "Dimitry Ivanov <2@ivanoff.org.ua> # curl -A cv ivanoff.org.ua",
   "description": "An OpenAI and Claude API compatible server using node-llama-cpp for local LLM models",
@@ -17,21 +18,28 @@
     "claude"
   ],
   "scripts": {
-    "build": "bun build ./src/server.ts --outdir ./dist --minify --target node --external node-llama-cpp --external express && tsc",
-    "start": "node ./dist/server.js"
+    "build": "npm run typecheck && esbuild ./src/server.ts --bundle --platform=node --target=node20 --format=esm --packages=external --outfile=./dist/server.js",
+    "start": "node ./dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "watch": "tsc --noEmit --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/**/*.test.ts"
   },
   "dependencies": {
-    "@types/cors": "^2.8.17",
-    "@types/express": "^5.0.1",
-    "body-parser": "^1.20.2",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^5.1.0",
     "node-llama-cpp": "^3.7.0",
-    "the-log": "^3.0.1"
+    "the-log": "^3.0.1",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^20.14.9"
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.1",
+    "@types/node": "^20.14.9",
+    "esbuild": "^0.25.12",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
   },
   "repository": {
     "type": "git",

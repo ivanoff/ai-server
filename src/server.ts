@@ -1,346 +1,797 @@
 import 'the-log';
-import express from 'express';
 import cors from 'cors';
-import { getLlama, LlamaModel, LlamaChatSession } from 'node-llama-cpp';
-import bodyParser from 'body-parser';
-import dotenv from 'dotenv';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import type { Request, Response, NextFunction } from 'express';
-import type { MessageType, ChatCompletionRequestType, ClaudeMessageRequestType } from './types';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
+import express from 'express';
+import { getLlama, LlamaChatSession, LlamaModel } from 'node-llama-cpp';
+import type { NextFunction, Request, Response } from 'express';
+import type { ClaudeMessageRequestType, MessageType } from './types';
+import { config, corsOptions, getLlamaGpuOption } from './config';
+import { logger } from './logger';
+import { formatMessagesForLlama } from './prompt';
+import {
+  getValidationMessage,
+  isValidationError,
+  parseChatCompletionRequest,
+  parseClaudeMessageRequest
+} from './validation';
 
-// For working with __dirname in ESM
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// Load environment variables from .env file
-dotenv.config();
-const {
-  PORT,
-  MODEL_PATH,
-  DEFAULT_MAX_TOKENS,
-  GPU_LAYERS,
-  API_KEY
-} = process.env;
+type LlamaContextType = Awaited<ReturnType<LlamaModel['createContext']>>;
 
 const app = express();
-const port = PORT ? parseInt(PORT) : 3000;
-const modelPath = MODEL_PATH || path.join(__dirname, '..', 'models', 'llama-2-7b-chat.gguf');
-const defaultMaxTokens = parseInt(DEFAULT_MAX_TOKENS || '2048');
+let model: LlamaModel | null = null;
+let modelLoadedAt: string | null = null;
+let modelLoadError: string | null = null;
+let activeRequests = 0;
+const serviceStartedAt = Date.now();
 
-const apiKeyMiddleware: (req: Request, res: Response, next: NextFunction) => void = (req, res, next) => {
-  if (!API_KEY) return next();
+if (config.trustProxy) {
+  app.set('trust proxy', 1);
+}
 
-  const apiKeyRaw = req.headers['x-api-key'] || req.headers['authorization'] || '';
-  const apiKey = typeof apiKeyRaw === 'string' && apiKeyRaw.replace(/^bearer /i, '').trim();
+if (config.securityHeadersEnabled) {
+  app.disable('x-powered-by');
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    next();
+  });
+}
 
-  if (apiKey !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const incomingRequestId = req.header('x-request-id')?.trim();
+  const requestId = incomingRequestId && incomingRequestId.length > 0 ? incomingRequestId : randomUUID();
+  res.locals.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
+
+  const startedAt = process.hrtime.bigint();
+
+  logger.info('request.start', {
+    request_id: requestId,
+    method: req.method,
+    path: req.originalUrl,
+    ip: req.ip
+  });
+
+  res.on('finish', () => {
+    const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+
+    logger.info('request.finish', {
+      request_id: requestId,
+      method: req.method,
+      path: req.originalUrl,
+      status_code: res.statusCode,
+      duration_ms: Number(durationMs.toFixed(2)),
+      active_requests: activeRequests
+    });
+  });
+
+  next();
+});
+
+if (config.corsEnabled) {
+  app.use(cors(corsOptions));
+}
+
+app.use(express.json({ limit: config.bodyLimit }));
+
+function requestIdFrom(res: Response): string {
+  return typeof res.locals.requestId === 'string' ? res.locals.requestId : 'unknown';
+}
+
+function toErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return 'Unknown error';
+}
+
+function errorResponse(res: Response, status: number, message: string, type = 'server_error'): void {
+  res.status(status).json({
+    error: {
+      message,
+      type
+    },
+    request_id: requestIdFrom(res)
+  });
+}
+
+function sseErrorResponse(res: Response, message: string): void {
+  res.write(`data: ${JSON.stringify({ error: { message } })}\n\n`);
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+function safeCompare(secretA: string, secretB: string): boolean {
+  const secretABuffer = Buffer.from(secretA);
+  const secretBBuffer = Buffer.from(secretB);
+
+  if (secretABuffer.length !== secretBBuffer.length) {
+    return false;
+  }
+
+  return timingSafeEqual(secretABuffer, secretBBuffer);
+}
+
+function getApiKeyFromRequest(req: Request): string {
+  const xApiKey = req.header('x-api-key');
+  if (xApiKey && xApiKey.trim().length > 0) {
+    return xApiKey.trim();
+  }
+
+  const authHeader = req.header('authorization');
+  if (!authHeader) {
+    return '';
+  }
+
+  return authHeader.replace(/^bearer\s+/i, '').trim();
+}
+
+function acquireRequestSlot(): boolean {
+  if (activeRequests >= config.maxConcurrentRequests) {
+    return false;
+  }
+
+  activeRequests += 1;
+  return true;
+}
+
+function releaseRequestSlot(): void {
+  activeRequests = Math.max(0, activeRequests - 1);
+}
+
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+function extractChunkText(chunk: unknown): string {
+  if (typeof chunk === 'string') {
+    return chunk;
+  }
+
+  if (typeof chunk === 'object' && chunk !== null) {
+    const maybeText = (chunk as { text?: unknown }).text;
+    if (typeof maybeText === 'string') {
+      return maybeText;
+    }
+  }
+
+  return '';
+}
+
+function createGenerationAbortController(req: Request, res: Response, timeoutMs: number): {
+  signal: AbortSignal;
+  cleanup: () => void;
+} {
+  const controller = new AbortController();
+
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`Generation timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+
+  const onClientDisconnect = () => {
+    controller.abort(new Error('Client disconnected'));
+  };
+
+  req.on('aborted', onClientDisconnect);
+  req.on('close', onClientDisconnect);
+  res.on('close', onClientDisconnect);
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timer);
+      req.off('aborted', onClientDisconnect);
+      req.off('close', onClientDisconnect);
+      res.off('close', onClientDisconnect);
+    }
+  };
+}
+
+function isAbortError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return error.name === 'AbortError' || error.message.toLowerCase().includes('abort') || error.message.toLowerCase().includes('disconnect') || error.message.toLowerCase().includes('timed out');
+}
+
+const apiKeyMiddleware = (req: Request, res: Response, next: NextFunction): void => {
+  if (!config.apiKey) {
+    next();
+    return;
+  }
+
+  const requestApiKey = getApiKeyFromRequest(req);
+  if (!requestApiKey || !safeCompare(requestApiKey, config.apiKey)) {
+    errorResponse(res, 401, 'Unauthorized', 'authentication_error');
+    return;
+  }
 
   next();
 };
 
-// Middleware
-app.use(cors());
-app.use(bodyParser.json());
-
-// Initialize the model
-let model: LlamaModel;
-
-const llama = await getLlama({ gpu: "cuda" });
-console.log("GPU type:", llama.gpu);
-
-const initModel = async () => {
-  try {
-    model = await llama.loadModel({
-      modelPath: modelPath,
-      gpuLayers: GPU_LAYERS ? parseInt(GPU_LAYERS) : 0
-    });
-    console.log('Model loaded successfully');
-  } catch (error) {
-    console.error('Failed to load model:', error);
-    process.exit(1);
+function ensureModelLoaded(res: Response): boolean {
+  if (model) {
+    return true;
   }
-};
 
-// Convert messages to a format compatible with Llama
-function formatMessagesForLlama(messages: MessageType[]): string {
-  let formattedPrompt = '';
-  
-  for (const message of messages) {
-    const role = message.role.toLowerCase();
-    const content = message.content;
-    
-    if (role === 'system') {
-      formattedPrompt += `<s>[INST] <<SYS>>\n${content}\n<</SYS>>\n\n`;
-    } else if (role === 'user' || role === 'human') {
-      if (formattedPrompt === '') {
-        formattedPrompt += `<s>[INST] ${content} [/INST]`;
-      } else {
-        formattedPrompt += `[INST] ${content} [/INST]`;
-      }
-    } else if (role === 'assistant' || role === 'bot') {
-      formattedPrompt += ` ${content} </s>`;
-    }
-  }
-  
-  return formattedPrompt;
+  errorResponse(res, 503, 'Model is not loaded yet', 'service_unavailable_error');
+  return false;
 }
 
-// OpenAI compatible /chat/completions endpoint
-app.post('/v1/chat/completions', apiKeyMiddleware, async (req: Request, res: Response) => {
-  try {
-    const { messages, model: modelName, max_tokens, temperature, stream } = req.body as ChatCompletionRequestType;
-    
-    if (!messages || !Array.isArray(messages)) {
-      res.status(400).json({ error: 'Messages array is required' });
-      return;
-    }
-    
-    const maxTokens = max_tokens || defaultMaxTokens;
-    const temp = temperature || 0.7;
-    
-    const context = await model.createContext();
-    const contextSequence = context.getSequence();
+async function handleOpenAIStream(
+  res: Response,
+  session: LlamaChatSession,
+  prompt: string,
+  maxTokens: number,
+  temperature: number,
+  modelId: string,
+  signal: AbortSignal
+): Promise<void> {
+  const responseId = `chatcmpl-${Date.now()}`;
 
-    const session = new LlamaChatSession({contextSequence});
-    
-    const prompt = formatMessagesForLlama(messages);
-    
-    if (stream) {
-      // Streaming mode
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      
-      let fullResponse = '';
-      
-      try {
-        await session.promptWithMeta(prompt, {
-          onResponseChunk(chunk) {
-            fullResponse += chunk.text;
-          
-            const jsonData = {
-              id: `chatcmpl-${Date.now()}`,
-              object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000),
-              model: modelName || 'llama-local',
-              choices: [
-                {
-                  delta: { content: chunk },
-                  index: 0,
-                  finish_reason: null
-                }
-              ]
-            };
-            
-            res.write(`data: ${JSON.stringify(jsonData)}\n\n`);
-          }
-        });
-        
-        const finishData = {
-          id: `chatcmpl-${Date.now()}`,
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  if (typeof res.flushHeaders === 'function') {
+    res.flushHeaders();
+  }
+
+  res.write(
+    `data: ${JSON.stringify({
+      id: responseId,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model: modelId,
+      choices: [{ delta: { role: 'assistant' }, index: 0, finish_reason: null }]
+    })}\n\n`
+  );
+
+  await session.promptWithMeta(
+    prompt,
+    {
+      maxTokens,
+      temperature,
+      signal,
+      onResponseChunk(chunk: unknown) {
+        const text = extractChunkText(chunk);
+
+        if (!text || res.writableEnded) {
+          return;
+        }
+
+        const jsonData = {
+          id: responseId,
           object: 'chat.completion.chunk',
           created: Math.floor(Date.now() / 1000),
-          model: modelName || 'llama-local',
+          model: modelId,
           choices: [
             {
-              delta: {},
+              delta: { content: text },
               index: 0,
-              finish_reason: 'stop'
+              finish_reason: null
             }
           ]
         };
-        
-        res.write(`data: ${JSON.stringify(finishData)}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
-      } catch (error) {
-        console.error('Streaming error:', error);
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
-        res.end();
+
+        res.write(`data: ${JSON.stringify(jsonData)}\n\n`);
       }
-    } else {
-      // Non-streaming mode
-      const response = await session.prompt(prompt, {
-        maxTokens,
-        temperature: temp
-      });
+    } as never
+  );
 
-      res.json({
-        id: `chatcmpl-${Date.now()}`,
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model: modelName || 'llama-local',
-        choices: [
-          {
-            message: {
-              role: 'assistant',
-              content: response
-            },
-            index: 0,
-            finish_reason: 'stop'
-          }
-        ],
-        usage: {
-          prompt_tokens: Math.ceil(prompt.length / 4), // Quite average estimate
-          completion_tokens: Math.ceil(response.length / 4), // Quite average estimate
-          total_tokens: Math.ceil((prompt.length + response.length) / 4) // Quite average estimate
-        }
-      });
-    }
+  res.write(
+    `data: ${JSON.stringify({
+      id: responseId,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model: modelId,
+      choices: [{ delta: {}, index: 0, finish_reason: 'stop' }]
+    })}\n\n`
+  );
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
 
-    context.dispose();
+async function handleClaudeStream(
+  res: Response,
+  session: LlamaChatSession,
+  prompt: string,
+  maxTokens: number,
+  temperature: number,
+  modelId: string,
+  signal: AbortSignal
+): Promise<void> {
+  const messageId = `msg_${Date.now()}`;
 
-  } catch (error) {
-    console.error('Error processing request:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    res.status(500).json({ error: errorMessage });
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  if (typeof res.flushHeaders === 'function') {
+    res.flushHeaders();
   }
-});
 
-// Claude compatible API endpoint
-app.post('/v1/messages', apiKeyMiddleware, async (req: Request, res: Response) => {
-  try {
-    const { model: modelName, messages, max_tokens, temperature, stream } = req.body as ClaudeMessageRequestType;
-    
-    if (!messages || !Array.isArray(messages)) {
-      res.status(400).json({ error: 'Messages array is required' });
-      return;
-    }
-    
-    const maxTokens = max_tokens || defaultMaxTokens;
-    const temp = temperature || 0.7;
-    
-    // Transform messages from Claude format to Llama format
-    const transformedMessages = messages.map(msg => {
-      if (msg.role === 'human') {
-        return { role: 'user', content: msg.content };
-      } else if (msg.role === 'assistant') {
-        return { role: 'assistant', content: msg.content };
-      }
-      return msg;
-    });
-    
-    const context = await model.createContext();
-    const contextSequence = context.getSequence();
-
-    const session = new LlamaChatSession({contextSequence});
-
-    const prompt = formatMessagesForLlama(transformedMessages);
-    
-    if (stream) {
-      // Streaming mode
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      
-      let fullResponse = '';
-      
-      try {
-        await session.promptWithMeta(prompt, {
-          onResponseChunk(chunk) {
-            fullResponse += chunk.text;
-            const jsonData = {
-              type: 'content_block_delta',
-              delta: {
-                type: 'text_delta',
-                text: chunk
-              },
-              index: 0
-            };
-            
-            res.write(`data: ${JSON.stringify(jsonData)}\n\n`);
-          }
-        });
-        
-        const finalData = {
-          type: 'message_delta',
-          delta: {
-            stop_reason: 'end_turn',
-            stop_sequence: null
-          },
-          usage: {
-            output_tokens: Math.ceil(fullResponse.length / 4)
-          }
-        };
-        
-        res.write(`data: ${JSON.stringify(finalData)}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
-      } catch (error) {
-        console.error('Streaming error:', error);
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
-        res.end();
-      }
-    } else {
-      // Non-streaming mode
-      const response = await session.prompt(prompt, {
-        maxTokens,
-        temperature: temp
-      });
-      
-      res.json({
-        id: `msg_${Date.now()}`,
+  res.write(
+    `data: ${JSON.stringify({
+      type: 'message_start',
+      message: {
+        id: messageId,
         type: 'message',
         role: 'assistant',
-        content: [
-          {
-            type: 'text',
-            text: response
-          }
-        ],
-        model: modelName || 'llama-local',
-        stop_reason: 'end_turn',
+        content: [],
+        model: modelId,
+        stop_reason: null,
         stop_sequence: null,
-        usage: {
-          input_tokens: Math.ceil(prompt.length / 4), // Average estimate
-          output_tokens: Math.ceil(response.length / 4) // Average estimate
+        usage: { input_tokens: estimateTokens(prompt), output_tokens: 0 }
+      }
+    })}\n\n`
+  );
+
+  res.write(
+    `data: ${JSON.stringify({
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'text',
+        text: ''
+      }
+    })}\n\n`
+  );
+
+  let outputTokens = 0;
+
+  await session.promptWithMeta(
+    prompt,
+    {
+      maxTokens,
+      temperature,
+      signal,
+      onResponseChunk(chunk: unknown) {
+        const text = extractChunkText(chunk);
+
+        if (!text || res.writableEnded) {
+          return;
         }
-      });
+
+        outputTokens += estimateTokens(text);
+
+        const jsonData = {
+          type: 'content_block_delta',
+          delta: {
+            type: 'text_delta',
+            text
+          },
+          index: 0
+        };
+
+        res.write(`data: ${JSON.stringify(jsonData)}\n\n`);
+      }
+    } as never
+  );
+
+  res.write(
+    `data: ${JSON.stringify({
+      type: 'content_block_stop',
+      index: 0
+    })}\n\n`
+  );
+
+  res.write(
+    `data: ${JSON.stringify({
+      type: 'message_delta',
+      delta: {
+        stop_reason: 'end_turn',
+        stop_sequence: null
+      },
+      usage: {
+        output_tokens: outputTokens
+      }
+    })}\n\n`
+  );
+
+  res.write(
+    `data: ${JSON.stringify({
+      type: 'message_stop'
+    })}\n\n`
+  );
+
+  res.end();
+}
+
+app.post('/v1/chat/completions', apiKeyMiddleware, async (req: Request, res: Response) => {
+  let parsedBody;
+
+  try {
+    parsedBody = parseChatCompletionRequest(req.body);
+  } catch (error) {
+    if (isValidationError(error)) {
+      errorResponse(res, 400, getValidationMessage(error), 'invalid_request_error');
+      return;
     }
 
-    context.dispose();
+    errorResponse(res, 400, 'Invalid request body', 'invalid_request_error');
+    return;
+  }
 
+  if (!ensureModelLoaded(res)) {
+    return;
+  }
+
+  if (!acquireRequestSlot()) {
+    errorResponse(res, 429, 'Too many concurrent requests', 'rate_limit_error');
+    return;
+  }
+
+  const modelId = parsedBody.model || config.modelId;
+  const maxTokens = parsedBody.max_tokens ?? config.defaultMaxTokens;
+  const temperature = parsedBody.temperature ?? 0.7;
+  const timeoutMs = parsedBody.timeout_ms ?? config.requestTimeoutMs;
+
+  let context: LlamaContextType | undefined;
+  let cleanupAbort: (() => void) | undefined;
+
+  try {
+    context = await model!.createContext();
+
+    const session = new LlamaChatSession({
+      contextSequence: context.getSequence()
+    });
+
+    const prompt = formatMessagesForLlama(parsedBody.messages);
+
+    const abort = createGenerationAbortController(req, res, timeoutMs);
+    cleanupAbort = abort.cleanup;
+
+    if (parsedBody.stream) {
+      await handleOpenAIStream(res, session, prompt, maxTokens, temperature, modelId, abort.signal);
+      return;
+    }
+
+    const response = await session.prompt(
+      prompt,
+      {
+        maxTokens,
+        temperature,
+        signal: abort.signal
+      } as never
+    );
+
+    res.json({
+      id: `chatcmpl-${Date.now()}`,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: modelId,
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: response
+          },
+          index: 0,
+          finish_reason: 'stop'
+        }
+      ],
+      usage: {
+        prompt_tokens: estimateTokens(prompt),
+        completion_tokens: estimateTokens(response),
+        total_tokens: estimateTokens(prompt + response)
+      }
+    });
   } catch (error) {
-    console.error('Error processing request:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    res.status(500).json({ error: errorMessage });
+    const message = toErrorMessage(error);
+
+    if (isAbortError(error)) {
+      const status = message.toLowerCase().includes('timed out') ? 408 : 499;
+
+      if (res.headersSent) {
+        if (!res.writableEnded) {
+          sseErrorResponse(res, message);
+        }
+        return;
+      }
+
+      errorResponse(res, status, message, 'request_aborted_error');
+      return;
+    }
+
+    logger.error('chat.completions.error', {
+      request_id: requestIdFrom(res),
+      error: message
+    });
+
+    if (res.headersSent) {
+      if (!res.writableEnded) {
+        sseErrorResponse(res, message);
+      }
+      return;
+    }
+
+    errorResponse(res, 500, message, 'server_error');
+  } finally {
+    cleanupAbort?.();
+
+    if (context) {
+      try {
+        context.dispose();
+      } catch (error) {
+        logger.warn('context.dispose.failed', {
+          request_id: requestIdFrom(res),
+          error: toErrorMessage(error)
+        });
+      }
+    }
+
+    releaseRequestSlot();
   }
 });
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', model: modelPath });
+app.post('/v1/messages', apiKeyMiddleware, async (req: Request, res: Response) => {
+  let parsedBody: ClaudeMessageRequestType;
+
+  try {
+    parsedBody = parseClaudeMessageRequest(req.body);
+  } catch (error) {
+    if (isValidationError(error)) {
+      errorResponse(res, 400, getValidationMessage(error), 'invalid_request_error');
+      return;
+    }
+
+    errorResponse(res, 400, 'Invalid request body', 'invalid_request_error');
+    return;
+  }
+
+  if (!ensureModelLoaded(res)) {
+    return;
+  }
+
+  if (!acquireRequestSlot()) {
+    errorResponse(res, 429, 'Too many concurrent requests', 'rate_limit_error');
+    return;
+  }
+
+  const transformedMessages: MessageType[] = parsedBody.messages.map((message) => {
+    if (message.role === 'human' || message.role === 'user') {
+      return { role: 'user', content: message.content };
+    }
+
+    return { role: 'assistant', content: message.content };
+  });
+
+  const modelId = parsedBody.model || config.modelId;
+  const maxTokens = parsedBody.max_tokens ?? config.defaultMaxTokens;
+  const temperature = parsedBody.temperature ?? 0.7;
+  const timeoutMs = parsedBody.timeout_ms ?? config.requestTimeoutMs;
+
+  let context: LlamaContextType | undefined;
+  let cleanupAbort: (() => void) | undefined;
+
+  try {
+    context = await model!.createContext();
+
+    const session = new LlamaChatSession({
+      contextSequence: context.getSequence()
+    });
+
+    const prompt = formatMessagesForLlama(transformedMessages);
+
+    const abort = createGenerationAbortController(req, res, timeoutMs);
+    cleanupAbort = abort.cleanup;
+
+    if (parsedBody.stream) {
+      await handleClaudeStream(res, session, prompt, maxTokens, temperature, modelId, abort.signal);
+      return;
+    }
+
+    const response = await session.prompt(
+      prompt,
+      {
+        maxTokens,
+        temperature,
+        signal: abort.signal
+      } as never
+    );
+
+    res.json({
+      id: `msg_${Date.now()}`,
+      type: 'message',
+      role: 'assistant',
+      content: [
+        {
+          type: 'text',
+          text: response
+        }
+      ],
+      model: modelId,
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+      usage: {
+        input_tokens: estimateTokens(prompt),
+        output_tokens: estimateTokens(response)
+      }
+    });
+  } catch (error) {
+    const message = toErrorMessage(error);
+
+    if (isAbortError(error)) {
+      const status = message.toLowerCase().includes('timed out') ? 408 : 499;
+
+      if (res.headersSent) {
+        if (!res.writableEnded) {
+          sseErrorResponse(res, message);
+        }
+        return;
+      }
+
+      errorResponse(res, status, message, 'request_aborted_error');
+      return;
+    }
+
+    logger.error('messages.error', {
+      request_id: requestIdFrom(res),
+      error: message
+    });
+
+    if (res.headersSent) {
+      if (!res.writableEnded) {
+        sseErrorResponse(res, message);
+      }
+      return;
+    }
+
+    errorResponse(res, 500, message, 'server_error');
+  } finally {
+    cleanupAbort?.();
+
+    if (context) {
+      try {
+        context.dispose();
+      } catch (error) {
+        logger.warn('context.dispose.failed', {
+          request_id: requestIdFrom(res),
+          error: toErrorMessage(error)
+        });
+      }
+    }
+
+    releaseRequestSlot();
+  }
 });
 
-// Models endpoint for OpenAI API compatibility
-app.get('/v1/models', (req, res) => {
+app.get('/health', (req: Request, res: Response) => {
+  res.json({
+    status: 'ok',
+    uptime_seconds: Math.floor((Date.now() - serviceStartedAt) / 1000),
+    model: {
+      id: config.modelId,
+      loaded: Boolean(model),
+      loaded_at: modelLoadedAt,
+      load_error: modelLoadError,
+      path: config.exposeModelPathInHealth ? config.modelPath : undefined
+    },
+    requests: {
+      active: activeRequests,
+      max_concurrent: config.maxConcurrentRequests
+    },
+    runtime: {
+      gpu_backend: config.gpuBackend,
+      gpu_layers: config.gpuLayers,
+      request_timeout_ms: config.requestTimeoutMs
+    }
+  });
+});
+
+app.get('/ready', (req: Request, res: Response) => {
+  if (!model) {
+    res.status(503).json({
+      status: 'not_ready',
+      reason: modelLoadError || 'model_not_loaded',
+      request_id: requestIdFrom(res)
+    });
+    return;
+  }
+
+  res.json({
+    status: 'ready',
+    request_id: requestIdFrom(res)
+  });
+});
+
+app.get('/v1/models', apiKeyMiddleware, (req: Request, res: Response) => {
   res.json({
     object: 'list',
     data: [
       {
-        id: 'llama-local',
+        id: config.modelId,
         object: 'model',
-        created: Math.floor(Date.now() / 1000),
+        created: Math.floor(serviceStartedAt / 1000),
         owned_by: 'local'
       }
     ]
   });
 });
 
-// Initialize and start the server
-const startServer = async () => {
-  await initModel();
-  
-  app.listen(port, () => {
-    console.log(`Llama API server running on port ${port}`);
-    console.log(`Model path: ${modelPath}`);
-  });
-};
+app.use((error: Error, req: Request, res: Response, next: NextFunction) => {
+  if (error instanceof SyntaxError && 'body' in error) {
+    errorResponse(res, 400, 'Invalid JSON payload', 'invalid_request_error');
+    return;
+  }
 
-startServer().catch(error => {
-  console.error('Failed to start server:', error);
+  next(error);
+});
+
+app.use((error: Error, req: Request, res: Response, next: NextFunction) => {
+  logger.error('unhandled.error', {
+    request_id: requestIdFrom(res),
+    error: toErrorMessage(error)
+  });
+
+  if (!res.headersSent) {
+    errorResponse(res, 500, 'Internal server error', 'server_error');
+    return;
+  }
+
+  next(error);
+});
+
+async function initModel(): Promise<void> {
+  try {
+    const llama = await getLlama(getLlamaGpuOption());
+
+    logger.info('llama.runtime.ready', {
+      gpu_backend: config.gpuBackend,
+      llama_gpu: String(llama.gpu)
+    });
+
+    model = await llama.loadModel({
+      modelPath: config.modelPath,
+      gpuLayers: config.gpuLayers
+    });
+
+    modelLoadedAt = new Date().toISOString();
+    modelLoadError = null;
+
+    logger.info('model.loaded', {
+      model_id: config.modelId,
+      model_path: config.modelPath,
+      gpu_layers: config.gpuLayers
+    });
+  } catch (error) {
+    model = null;
+    modelLoadError = toErrorMessage(error);
+
+    logger.error('model.load.failed', {
+      error: modelLoadError,
+      model_path: config.modelPath,
+      gpu_backend: config.gpuBackend,
+      gpu_layers: config.gpuLayers
+    });
+
+    throw error;
+  }
+}
+
+async function startServer(): Promise<void> {
+  await initModel();
+
+  app.listen(config.port, () => {
+    logger.info('server.started', {
+      port: config.port,
+      model_id: config.modelId,
+      cors_enabled: config.corsEnabled,
+      max_concurrent_requests: config.maxConcurrentRequests
+    });
+  });
+}
+
+startServer().catch((error) => {
+  logger.error('server.start.failed', {
+    error: toErrorMessage(error)
+  });
+
   process.exit(1);
 });
